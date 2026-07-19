@@ -1,0 +1,27 @@
+{
+  "name": "onehome-browserbase",
+  "version": "1.0.0",
+  "description": "Automate OneHome CSV export and sync to Airtable",
+  "type": "module",
+  "main": "onehome-export.js",
+  "scripts": {
+    "export": "node onehome-export.js",
+    "sync": "node airtable-sync.js",
+    "pipeline": "node run-pipeline.js",
+    "setup-airtable": "node create-airtable-tables.js"
+  },
+  "keywords": [
+    "onehome",
+    "browserbase",
+    "playwright",
+    "csv-export",
+    "airtable"
+  ],
+  "license": "ISC",
+  "dependencies": {
+    "@browserbasehq/sdk": "^2.15.0",
+    "csv-parse": "^5.6.0",
+    "dotenv": "^17.4.2",
+    "playwright-core": "^1.61.1"
+  }
+}
