@@ -35,15 +35,16 @@ jobs:
       AIRTABLE_LISTINGS_TABLE: Listings
       AIRTABLE_CHANGE_LOG_TABLE: Change Log
       AIRTABLE_MOVED_LIST_TABLE: Moved List
+      AIRTABLE_SYNC_RUNS_TABLE: Sync Runs
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
 
       - name: Install dependencies

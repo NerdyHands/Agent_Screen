@@ -15,7 +15,11 @@ const DOWNLOADS_DIR = path.join(__dirname, "downloads");
 const BATCH_SIZE = 10;
 const THROTTLE_MIN_MS = 250;
 const THROTTLE_MAX_MS = 350;
+const CENSUS_THROTTLE_MS = 150;
 const DRY_RUN_SAMPLE_COUNT = 3;
+const DEFAULT_STATE = "VA";
+const CENSUS_GEOCODER_URL =
+  "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress";
 
 const MOVED_STATUSES = new Set([
   "sold",
@@ -31,6 +35,7 @@ const UPDATE_FIELDS = [
   "Price",
   "Address",
   "City",
+  "Zip",
   "Property Type",
   "Beds",
   "Baths",
@@ -69,6 +74,7 @@ function getConfig() {
     listingsTable: process.env.AIRTABLE_LISTINGS_TABLE.trim(),
     changeLogTable: process.env.AIRTABLE_CHANGE_LOG_TABLE.trim(),
     movedListTable: process.env.AIRTABLE_MOVED_LIST_TABLE.trim(),
+    syncRunsTable: (process.env.AIRTABLE_SYNC_RUNS_TABLE || "Sync Runs").trim(),
   };
 }
 
@@ -134,6 +140,22 @@ function stripBomFromHeaders(record) {
   return normalized;
 }
 
+export function buildFullAddress(address, city, zip, state = DEFAULT_STATE) {
+  const street = trimText(address);
+  const cityName = trimText(city);
+  const zipCode = trimText(zip);
+  if (!street || !cityName) {
+    return "";
+  }
+  return zipCode
+    ? `${street}, ${cityName}, ${state} ${zipCode}`
+    : `${street}, ${cityName}, ${state}`;
+}
+
+export function addressCacheKey(address, city, state = DEFAULT_STATE) {
+  return `${trimText(address).toLowerCase()}|${trimText(city).toLowerCase()}|${trimText(state).toLowerCase()}`;
+}
+
 export function normalizeCsvRow(row) {
   const cleaned = stripBomFromHeaders(row);
   const mls = trimText(cleaned["MLS #"]);
@@ -159,7 +181,8 @@ export function normalizeCsvRow(row) {
       Price: price,
       Address: address,
       City: city,
-      "Full Address": address && city ? `${address}, ${city}, VA` : "",
+      Zip: null,
+      "Full Address": buildFullAddress(address, city, null),
       "Property Type": trimText(cleaned["Property Type"]),
       Beds: beds,
       Baths: baths,
@@ -168,6 +191,103 @@ export function normalizeCsvRow(row) {
       "Price per/Sqft": pricePerSqft,
       Utilities: utilities || null,
     },
+  };
+}
+
+/**
+ * Resolve ZIP via US Census geocoder (free, no API key).
+ * Returns 5-digit ZIP or null when unmatched / request fails.
+ */
+export async function lookupZipFromCensus(
+  address,
+  city,
+  state = DEFAULT_STATE
+) {
+  const street = trimText(address);
+  const cityName = trimText(city);
+  if (!street || !cityName) {
+    return null;
+  }
+
+  const oneLine = `${street}, ${cityName}, ${state}`;
+  const url = new URL(CENSUS_GEOCODER_URL);
+  url.searchParams.set("address", oneLine);
+  url.searchParams.set("benchmark", "Public_AR_Current");
+  url.searchParams.set("format", "json");
+
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      return null;
+    }
+    const payload = await response.json();
+    const zip = trimText(
+      payload?.result?.addressMatches?.[0]?.addressComponents?.zip
+    );
+    return /^\d{5}(-\d{4})?$/.test(zip) ? zip.slice(0, 5) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fill Zip (and Full Address) on normalized rows.
+ * Reuses existing Airtable Zip when address/city unchanged; otherwise
+ * looks up via Census with an in-run address cache.
+ */
+export async function enrichNormalizedRowsWithZip(
+  normalizedRows,
+  existingByMls = new Map()
+) {
+  const cache = new Map();
+  let lookups = 0;
+  let cacheHits = 0;
+  let reusedExisting = 0;
+  let unresolved = 0;
+
+  for (const row of normalizedRows) {
+    const address = trimText(row.fields.Address);
+    const city = trimText(row.fields.City);
+    const existing = existingByMls.get(row.mls);
+    const existingFields = existing?.fields ?? {};
+    const existingZip = trimText(existingFields.Zip) || null;
+    const addressUnchanged =
+      Boolean(existing) &&
+      valuesEqual(existingFields.Address, address) &&
+      valuesEqual(existingFields.City, city);
+
+    let zip = null;
+
+    if (addressUnchanged && existingZip) {
+      zip = existingZip;
+      reusedExisting += 1;
+    } else {
+      const key = addressCacheKey(address, city);
+      if (cache.has(key)) {
+        zip = cache.get(key);
+        cacheHits += 1;
+      } else {
+        await sleep(CENSUS_THROTTLE_MS);
+        zip = await lookupZipFromCensus(address, city);
+        cache.set(key, zip);
+        lookups += 1;
+      }
+    }
+
+    if (!zip) {
+      unresolved += 1;
+    }
+
+    row.fields.Zip = zip;
+    row.fields["Full Address"] = buildFullAddress(address, city, zip);
+  }
+
+  return {
+    rows: normalizedRows,
+    zip_lookups: lookups,
+    zip_cache_hits: cacheHits,
+    zip_reused_existing: reusedExisting,
+    zip_unresolved: unresolved,
   };
 }
 
@@ -586,6 +706,75 @@ export async function executeAirtableWrites(plan) {
   );
 }
 
+/**
+ * Write one Sync Runs health row. Best-effort: returns { ok, error? }.
+ * Skipped entirely when DRY_RUN=true.
+ */
+export async function writeSyncRunRecord(fields, options = {}) {
+  const dryRun = options.dryRun ?? isDryRun();
+  if (dryRun) {
+    return { ok: true, skipped: true, reason: "dry_run" };
+  }
+
+  try {
+    validateEnv();
+    const config = getConfig();
+    const payload = {
+      fields: {
+        "Run At": fields["Run At"] ?? new Date().toISOString(),
+        Success: Boolean(fields.Success),
+        Source: fields.Source ?? "sync",
+        "CSV File": fields["CSV File"] ?? null,
+        "CSV Rows": fields["CSV Rows"] ?? null,
+        "Normalized Rows": fields["Normalized Rows"] ?? null,
+        Created: fields.Created ?? null,
+        Updated: fields.Updated ?? null,
+        "Change Log": fields["Change Log"] ?? null,
+        "Moved Created": fields["Moved Created"] ?? null,
+        "Moved Updated": fields["Moved Updated"] ?? null,
+        Skipped: fields.Skipped ?? null,
+        "Zip Lookups": fields["Zip Lookups"] ?? null,
+        "Zip Unresolved": fields["Zip Unresolved"] ?? null,
+        "API Requests": fields["API Requests"] ?? null,
+        Error: fields.Error ?? null,
+      },
+    };
+
+    const created = await createAirtableRecords(config.syncRunsTable, [
+      payload,
+    ]);
+    return { ok: true, id: created[0]?.id ?? null };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function buildSyncRunFieldsFromResult(result, source = "sync") {
+  return {
+    "Run At": new Date().toISOString(),
+    Success: Boolean(result.success),
+    Source: source,
+    "CSV File": result.csv_file
+      ? path.basename(String(result.csv_file))
+      : null,
+    "CSV Rows": result.csv_rows ?? null,
+    "Normalized Rows": result.normalized_rows ?? null,
+    Created: result.records_to_create ?? null,
+    Updated: result.records_to_update ?? null,
+    "Change Log": result.change_log_records_to_create ?? null,
+    "Moved Created": result.moved_list_records_to_create ?? null,
+    "Moved Updated": result.moved_list_records_to_update ?? null,
+    Skipped: result.skipped_unchanged ?? null,
+    "Zip Lookups": result.zip_lookups ?? null,
+    "Zip Unresolved": result.zip_unresolved ?? null,
+    "API Requests": result.airtable_api_requests ?? null,
+    Error: result.error ?? null,
+  };
+}
+
 export async function syncListingsToAirtable(normalizedRows, options = {}) {
   const config = getConfig();
   const dryRun = options.dryRun ?? isDryRun();
@@ -600,6 +789,12 @@ export async function syncListingsToAirtable(normalizedRows, options = {}) {
 
   const existingByMls = buildExistingByMls(existingListings);
   const existingMovedByMls = buildExistingByMls(existingMovedRecords);
+
+  // Resolve ZIP codes (Census) before local create/update detection
+  const zipStats = await enrichNormalizedRowsWithZip(
+    normalizedRows,
+    existingByMls
+  );
 
   // STEP 6: Detect new listings locally
   // STEP 7: Detect changed listings locally
@@ -617,19 +812,27 @@ export async function syncListingsToAirtable(normalizedRows, options = {}) {
     changeLogRecordsToCreate: plan.changeLogRecordsToCreate,
   });
 
+  const summary = {
+    existing_airtable_records: existingListings.length,
+    records_to_create: plan.recordsToCreate.length,
+    records_to_update: plan.recordsToUpdate.length,
+    change_log_records_to_create: plan.changeLogRecordsToCreate.length,
+    moved_list_records_to_create: plan.movedListRecordsToCreate.length,
+    moved_list_records_to_update: plan.movedListRecordsToUpdate.length,
+    skipped_unchanged: plan.skippedUnchanged,
+    zip_lookups: zipStats.zip_lookups,
+    zip_cache_hits: zipStats.zip_cache_hits,
+    zip_reused_existing: zipStats.zip_reused_existing,
+    zip_unresolved: zipStats.zip_unresolved,
+    airtable_api_requests: airtableApiRequestCount,
+  };
+
   if (dryRun) {
     logDryRunSamples(plan);
     return {
       dry_run: true,
-      existing_airtable_records: existingListings.length,
-      records_to_create: plan.recordsToCreate.length,
-      records_to_update: plan.recordsToUpdate.length,
-      change_log_records_to_create: plan.changeLogRecordsToCreate.length,
-      moved_list_records_to_create: plan.movedListRecordsToCreate.length,
-      moved_list_records_to_update: plan.movedListRecordsToUpdate.length,
-      skipped_unchanged: plan.skippedUnchanged,
+      ...summary,
       airtable_writes_started_after_comparison: false,
-      airtable_api_requests: airtableApiRequestCount,
     };
   }
 
@@ -638,23 +841,18 @@ export async function syncListingsToAirtable(normalizedRows, options = {}) {
 
   return {
     dry_run: false,
-    existing_airtable_records: existingListings.length,
-    records_to_create: plan.recordsToCreate.length,
-    records_to_update: plan.recordsToUpdate.length,
-    change_log_records_to_create: plan.changeLogRecordsToCreate.length,
-    moved_list_records_to_create: plan.movedListRecordsToCreate.length,
-    moved_list_records_to_update: plan.movedListRecordsToUpdate.length,
-    skipped_unchanged: plan.skippedUnchanged,
+    ...summary,
     airtable_writes_started_after_comparison: true,
     airtable_api_requests: airtableApiRequestCount,
   };
 }
 
-export async function runAirtableSync(csvFilePath) {
+export async function runAirtableSync(csvFilePath, options = {}) {
   validateEnv();
   airtableApiRequestCount = 0;
 
-  const dryRun = isDryRun();
+  const dryRun = options.dryRun ?? isDryRun();
+  const source = options.source ?? "sync";
   const config = getConfig();
   const csvPath = csvFilePath ?? (await findNewestCsvFile());
 
@@ -679,7 +877,7 @@ export async function runAirtableSync(csvFilePath) {
     existingMovedRecords,
   });
 
-  return {
+  const result = {
     success: true,
     dry_run: dryRun,
     csv_file: csvPath,
@@ -687,6 +885,17 @@ export async function runAirtableSync(csvFilePath) {
     normalized_rows: normalizedRows.length,
     ...syncResult,
   };
+
+  const syncRun = await writeSyncRunRecord(
+    buildSyncRunFieldsFromResult(result, source),
+    { dryRun }
+  );
+  result.sync_run_written = syncRun.ok && !syncRun.skipped;
+  if (!syncRun.ok) {
+    result.sync_run_error = syncRun.error;
+  }
+
+  return result;
 }
 
 async function main() {
