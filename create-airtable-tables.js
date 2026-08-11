@@ -149,6 +149,10 @@ const TABLE_DEFINITIONS = [
       },
       { name: "Source", type: "singleLineText" },
       { name: "CSV File", type: "singleLineText" },
+      {
+        name: "CSV",
+        type: "multipleAttachments",
+      },
       { name: "CSV Rows", type: "number", options: { precision: 0 } },
       { name: "Normalized Rows", type: "number", options: { precision: 0 } },
       { name: "Created", type: "number", options: { precision: 0 } },

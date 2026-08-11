@@ -17,6 +17,8 @@ const THROTTLE_MIN_MS = 250;
 const THROTTLE_MAX_MS = 350;
 const CENSUS_THROTTLE_MS = 150;
 const DRY_RUN_SAMPLE_COUNT = 3;
+const MAX_CSV_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+const SYNC_RUN_CSV_FIELD = "CSV";
 const DEFAULT_STATE = "VA";
 const CENSUS_GEOCODER_URL =
   "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress";
@@ -782,6 +784,7 @@ export async function executeAirtableWrites(plan) {
 /**
  * Write one Sync Runs health row. Best-effort: returns { ok, error? }.
  * Skipped entirely when DRY_RUN=true.
+ * When csv_path is set, uploads the file into the CSV attachment field.
  */
 export async function writeSyncRunRecord(fields, options = {}) {
   const dryRun = options.dryRun ?? isDryRun();
@@ -792,12 +795,18 @@ export async function writeSyncRunRecord(fields, options = {}) {
   try {
     validateEnv();
     const config = getConfig();
+    const csvPath =
+      options.csvPath ?? fields.csv_path ?? fields["CSV Path"] ?? null;
+    const csvBasename =
+      fields["CSV File"] ??
+      (csvPath ? path.basename(String(csvPath)) : null);
+
     const payload = {
       fields: {
         "Run At": fields["Run At"] ?? new Date().toISOString(),
         Success: Boolean(fields.Success),
         Source: fields.Source ?? "sync",
-        "CSV File": fields["CSV File"] ?? null,
+        "CSV File": csvBasename,
         "CSV Rows": fields["CSV Rows"] ?? null,
         "Normalized Rows": fields["Normalized Rows"] ?? null,
         Created: fields.Created ?? null,
@@ -820,7 +829,26 @@ export async function writeSyncRunRecord(fields, options = {}) {
     const created = await createAirtableRecords(config.syncRunsTable, [
       payload,
     ]);
-    return { ok: true, id: created[0]?.id ?? null };
+    const recordId = created[0]?.id ?? null;
+
+    let csvAttached = false;
+    let csvAttachError = null;
+    if (recordId && csvPath) {
+      try {
+        await uploadCsvAttachment(recordId, csvPath);
+        csvAttached = true;
+      } catch (error) {
+        csvAttachError =
+          error instanceof Error ? error.message : String(error);
+      }
+    }
+
+    return {
+      ok: true,
+      id: recordId,
+      csv_attached: csvAttached,
+      csv_attach_error: csvAttachError,
+    };
   } catch (error) {
     return {
       ok: false,
@@ -829,14 +857,61 @@ export async function writeSyncRunRecord(fields, options = {}) {
   }
 }
 
+/**
+ * Upload a local CSV into Sync Runs attachment field `CSV`
+ * via Airtable uploadAttachment (max 5 MB).
+ */
+export async function uploadCsvAttachment(
+  recordId,
+  csvPath,
+  fieldName = SYNC_RUN_CSV_FIELD
+) {
+  const config = getConfig();
+  const absolutePath = path.resolve(String(csvPath));
+  const buffer = await readFile(absolutePath);
+
+  if (buffer.length > MAX_CSV_ATTACHMENT_BYTES) {
+    throw new Error(
+      `CSV too large to attach (${buffer.length} bytes; Airtable uploadAttachment max is 5 MB)`
+    );
+  }
+
+  await throttle();
+
+  const url = `https://api.airtable.com/v0/${config.baseId}/${encodeURIComponent(recordId)}/${encodeURIComponent(fieldName)}/uploadAttachment`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.pat}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      contentType: "text/csv",
+      filename: path.basename(absolutePath),
+      file: buffer.toString("base64"),
+    }),
+  });
+
+  airtableApiRequestCount += 1;
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(
+      `Airtable uploadAttachment failed (${response.status}): ${errorBody}`
+    );
+  }
+
+  return response.json();
+}
+
 function buildSyncRunFieldsFromResult(result, source = "sync") {
+  const csvPath = result.csv_file ? String(result.csv_file) : null;
   return {
     "Run At": new Date().toISOString(),
     Success: Boolean(result.success),
     Source: source,
-    "CSV File": result.csv_file
-      ? path.basename(String(result.csv_file))
-      : null,
+    csv_path: csvPath,
+    "CSV File": csvPath ? path.basename(csvPath) : null,
     "CSV Rows": result.csv_rows ?? null,
     "Normalized Rows": result.normalized_rows ?? null,
     Created: result.records_to_create ?? null,
@@ -996,8 +1071,11 @@ export async function runAirtableSync(csvFilePath, options = {}) {
     { dryRun }
   );
   result.sync_run_written = syncRun.ok && !syncRun.skipped;
+  result.csv_attached = Boolean(syncRun.csv_attached);
   if (!syncRun.ok) {
     result.sync_run_error = syncRun.error;
+  } else if (syncRun.csv_attach_error) {
+    result.csv_attach_error = syncRun.csv_attach_error;
   }
 
   return result;

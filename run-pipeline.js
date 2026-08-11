@@ -42,18 +42,23 @@ async function main() {
 
     // Log failed runs when sync never got to write its own Sync Runs row
     if (!pipelineSummary.sync?.sync_run_written) {
+      const exportCsv = pipelineSummary.export?.csv_file
+        ? String(pipelineSummary.export.csv_file)
+        : null;
       const syncRun = await writeSyncRunRecord({
         "Run At": new Date().toISOString(),
         Success: false,
         Source: "pipeline",
-        "CSV File": pipelineSummary.export?.csv_file
-          ? String(pipelineSummary.export.csv_file).split(/[/\\]/).pop()
-          : null,
+        csv_path: exportCsv,
+        "CSV File": exportCsv ? exportCsv.split(/[/\\]/).pop() : null,
         Error: pipelineSummary.error,
       });
       pipelineSummary.sync_run_written = syncRun.ok && !syncRun.skipped;
+      pipelineSummary.csv_attached = Boolean(syncRun.csv_attached);
       if (!syncRun.ok) {
         pipelineSummary.sync_run_error = syncRun.error;
+      } else if (syncRun.csv_attach_error) {
+        pipelineSummary.csv_attach_error = syncRun.csv_attach_error;
       }
     }
 
