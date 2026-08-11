@@ -21,14 +21,12 @@ const DEFAULT_STATE = "VA";
 const CENSUS_GEOCODER_URL =
   "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress";
 
-const MOVED_STATUSES = new Set([
-  "sold",
-  "closed",
-  "off market",
-  "recently sold",
-  "withdrawn",
-  "expired",
-]);
+const PENDING_STATUSES = new Set(["pending", "under contract"]);
+
+const SOLD_STATUSES = new Set(["sold", "closed", "recently sold"]);
+
+// Other exit statuses that are neither Pending nor Sold — still tracked in Moved List.
+const MOVED_STATUSES = new Set(["off market", "withdrawn", "expired"]);
 
 const UPDATE_FIELDS = [
   "Status",
@@ -50,6 +48,8 @@ const REQUIRED_ENV = [
   "AIRTABLE_LISTINGS_TABLE",
   "AIRTABLE_CHANGE_LOG_TABLE",
   "AIRTABLE_MOVED_LIST_TABLE",
+  "AIRTABLE_PENDING_LIST_TABLE",
+  "AIRTABLE_SOLD_LIST_TABLE",
 ];
 
 let airtableApiRequestCount = 0;
@@ -74,6 +74,8 @@ function getConfig() {
     listingsTable: process.env.AIRTABLE_LISTINGS_TABLE.trim(),
     changeLogTable: process.env.AIRTABLE_CHANGE_LOG_TABLE.trim(),
     movedListTable: process.env.AIRTABLE_MOVED_LIST_TABLE.trim(),
+    pendingListTable: process.env.AIRTABLE_PENDING_LIST_TABLE.trim(),
+    soldListTable: process.env.AIRTABLE_SOLD_LIST_TABLE.trim(),
     syncRunsTable: (process.env.AIRTABLE_SYNC_RUNS_TABLE || "Sync Runs").trim(),
   };
 }
@@ -320,6 +322,14 @@ function formatChangeKeyTimestamp(date = new Date()) {
   );
 }
 
+function isPendingStatus(status) {
+  return PENDING_STATUSES.has(trimText(status).toLowerCase());
+}
+
+function isSoldStatus(status) {
+  return SOLD_STATUSES.has(trimText(status).toLowerCase());
+}
+
 function isMovedStatus(status) {
   return MOVED_STATUSES.has(trimText(status).toLowerCase());
 }
@@ -392,19 +402,22 @@ export function normalizeCsvRows(rawRows) {
   return [...byMls.values()];
 }
 
-function buildMovedListChanges(movedCandidates, existingMovedByMls) {
+// Shared upsert-delta logic for Pending List, Sold List, and Moved List.
+// dateFieldName lets each list use its own timestamp column
+// ("Went Pending At" / "Sold At" / "Moved At").
+function buildStatusListChanges(candidates, existingByMls, dateFieldName) {
   const recordsToCreate = [];
   const recordsToUpdate = [];
   let skipped = 0;
 
-  for (const candidate of movedCandidates) {
-    const existing = existingMovedByMls.get(candidate.mls);
+  for (const candidate of candidates) {
+    const existing = existingByMls.get(candidate.mls);
     const nextFields = {
       "MLS #": candidate.mls,
       Status: candidate.status,
       Price: candidate.price,
       "Full Address": candidate.fullAddress,
-      "Moved At": candidate.movedAt,
+      [dateFieldName]: candidate.at,
     };
 
     if (!existing) {
@@ -432,26 +445,36 @@ export function buildListingSyncPlan(
   normalizedRows,
   existingByMls,
   existingMovedByMls,
-  nowIso = new Date().toISOString()
+  nowIso = new Date().toISOString(),
+  existingPendingByMls = new Map(),
+  existingSoldByMls = new Map()
 ) {
   const recordsToCreate = [];
   const recordsToUpdate = [];
   const changeLogRecordsToCreate = [];
   const movedCandidates = [];
+  const pendingCandidates = [];
+  const soldCandidates = [];
   let skippedUnchanged = 0;
 
   for (const row of normalizedRows) {
     const { mls, fields } = row;
     const existing = existingByMls.get(mls);
 
-    if (isMovedStatus(fields.Status)) {
-      movedCandidates.push({
-        mls,
-        status: fields.Status,
-        price: fields.Price,
-        fullAddress: fields["Full Address"],
-        movedAt: nowIso,
-      });
+    // Mutually exclusive: Pending, then Sold, then other exit statuses.
+    const candidate = {
+      mls,
+      status: fields.Status,
+      price: fields.Price,
+      fullAddress: fields["Full Address"],
+      at: nowIso,
+    };
+    if (isPendingStatus(fields.Status)) {
+      pendingCandidates.push(candidate);
+    } else if (isSoldStatus(fields.Status)) {
+      soldCandidates.push(candidate);
+    } else if (isMovedStatus(fields.Status)) {
+      movedCandidates.push(candidate);
     }
 
     // STEP 6: Detect new listings locally
@@ -504,7 +527,23 @@ export function buildListingSyncPlan(
     recordsToCreate: movedListRecordsToCreate,
     recordsToUpdate: movedListRecordsToUpdate,
     skipped: movedListSkipped,
-  } = buildMovedListChanges(movedCandidates, existingMovedByMls);
+  } = buildStatusListChanges(movedCandidates, existingMovedByMls, "Moved At");
+
+  const {
+    recordsToCreate: pendingListRecordsToCreate,
+    recordsToUpdate: pendingListRecordsToUpdate,
+    skipped: pendingListSkipped,
+  } = buildStatusListChanges(
+    pendingCandidates,
+    existingPendingByMls,
+    "Went Pending At"
+  );
+
+  const {
+    recordsToCreate: soldListRecordsToCreate,
+    recordsToUpdate: soldListRecordsToUpdate,
+    skipped: soldListSkipped,
+  } = buildStatusListChanges(soldCandidates, existingSoldByMls, "Sold At");
 
   return {
     recordsToCreate,
@@ -513,6 +552,12 @@ export function buildListingSyncPlan(
     movedListRecordsToCreate,
     movedListRecordsToUpdate,
     movedListSkipped,
+    pendingListRecordsToCreate,
+    pendingListRecordsToUpdate,
+    pendingListSkipped,
+    soldListRecordsToCreate,
+    soldListRecordsToUpdate,
+    soldListSkipped,
     skippedUnchanged,
   };
 }
@@ -569,6 +614,18 @@ function logDryRunSamples(plan) {
           ),
           moved_list_records_to_update: sampleRecords(
             plan.movedListRecordsToUpdate
+          ),
+          pending_list_records_to_create: sampleRecords(
+            plan.pendingListRecordsToCreate
+          ),
+          pending_list_records_to_update: sampleRecords(
+            plan.pendingListRecordsToUpdate
+          ),
+          sold_list_records_to_create: sampleRecords(
+            plan.soldListRecordsToCreate
+          ),
+          sold_list_records_to_update: sampleRecords(
+            plan.soldListRecordsToUpdate
           ),
         },
       },
@@ -704,6 +761,22 @@ export async function executeAirtableWrites(plan) {
     config.movedListTable,
     plan.movedListRecordsToUpdate
   );
+  await createAirtableRecords(
+    config.pendingListTable,
+    plan.pendingListRecordsToCreate
+  );
+  await updateAirtableRecords(
+    config.pendingListTable,
+    plan.pendingListRecordsToUpdate
+  );
+  await createAirtableRecords(
+    config.soldListTable,
+    plan.soldListRecordsToCreate
+  );
+  await updateAirtableRecords(
+    config.soldListTable,
+    plan.soldListRecordsToUpdate
+  );
 }
 
 /**
@@ -732,6 +805,10 @@ export async function writeSyncRunRecord(fields, options = {}) {
         "Change Log": fields["Change Log"] ?? null,
         "Moved Created": fields["Moved Created"] ?? null,
         "Moved Updated": fields["Moved Updated"] ?? null,
+        "Pending Created": fields["Pending Created"] ?? null,
+        "Pending Updated": fields["Pending Updated"] ?? null,
+        "Sold Created": fields["Sold Created"] ?? null,
+        "Sold Updated": fields["Sold Updated"] ?? null,
         Skipped: fields.Skipped ?? null,
         "Zip Lookups": fields["Zip Lookups"] ?? null,
         "Zip Unresolved": fields["Zip Unresolved"] ?? null,
@@ -767,6 +844,10 @@ function buildSyncRunFieldsFromResult(result, source = "sync") {
     "Change Log": result.change_log_records_to_create ?? null,
     "Moved Created": result.moved_list_records_to_create ?? null,
     "Moved Updated": result.moved_list_records_to_update ?? null,
+    "Pending Created": result.pending_list_records_to_create ?? null,
+    "Pending Updated": result.pending_list_records_to_update ?? null,
+    "Sold Created": result.sold_list_records_to_create ?? null,
+    "Sold Updated": result.sold_list_records_to_update ?? null,
     Skipped: result.skipped_unchanged ?? null,
     "Zip Lookups": result.zip_lookups ?? null,
     "Zip Unresolved": result.zip_unresolved ?? null,
@@ -780,15 +861,24 @@ export async function syncListingsToAirtable(normalizedRows, options = {}) {
   const dryRun = options.dryRun ?? isDryRun();
   const existingListings = options.existingListings;
   const existingMovedRecords = options.existingMovedRecords;
+  const existingPendingRecords = options.existingPendingRecords;
+  const existingSoldRecords = options.existingSoldRecords;
 
-  if (!existingListings || !existingMovedRecords) {
+  if (
+    !existingListings ||
+    !existingMovedRecords ||
+    !existingPendingRecords ||
+    !existingSoldRecords
+  ) {
     throw new Error(
-      "syncListingsToAirtable requires existingListings and existingMovedRecords from step 5"
+      "syncListingsToAirtable requires existingListings, existingMovedRecords, existingPendingRecords, and existingSoldRecords from step 5"
     );
   }
 
   const existingByMls = buildExistingByMls(existingListings);
   const existingMovedByMls = buildExistingByMls(existingMovedRecords);
+  const existingPendingByMls = buildExistingByMls(existingPendingRecords);
+  const existingSoldByMls = buildExistingByMls(existingSoldRecords);
 
   // Resolve ZIP codes (Census) before local create/update detection
   const zipStats = await enrichNormalizedRowsWithZip(
@@ -801,7 +891,10 @@ export async function syncListingsToAirtable(normalizedRows, options = {}) {
   const plan = buildListingSyncPlan(
     normalizedRows,
     existingByMls,
-    existingMovedByMls
+    existingMovedByMls,
+    new Date().toISOString(),
+    existingPendingByMls,
+    existingSoldByMls
   );
 
   assertReadyForAirtableWrites({
@@ -819,6 +912,10 @@ export async function syncListingsToAirtable(normalizedRows, options = {}) {
     change_log_records_to_create: plan.changeLogRecordsToCreate.length,
     moved_list_records_to_create: plan.movedListRecordsToCreate.length,
     moved_list_records_to_update: plan.movedListRecordsToUpdate.length,
+    pending_list_records_to_create: plan.pendingListRecordsToCreate.length,
+    pending_list_records_to_update: plan.pendingListRecordsToUpdate.length,
+    sold_list_records_to_create: plan.soldListRecordsToCreate.length,
+    sold_list_records_to_update: plan.soldListRecordsToUpdate.length,
     skipped_unchanged: plan.skippedUnchanged,
     zip_lookups: zipStats.zip_lookups,
     zip_cache_hits: zipStats.zip_cache_hits,
@@ -866,15 +963,23 @@ export async function runAirtableSync(csvFilePath, options = {}) {
   const existingListings = await getAllAirtableRecords(config.listingsTable);
   const existingByMls = buildExistingByMls(existingListings);
 
-  // One-time read of Moved List for local comparison (no writes until step 8)
+  // One-time reads of Moved/Pending/Sold lists for local comparison (no writes until step 8)
   const existingMovedRecords = await getAllAirtableRecords(
     config.movedListTable
+  );
+  const existingPendingRecords = await getAllAirtableRecords(
+    config.pendingListTable
+  );
+  const existingSoldRecords = await getAllAirtableRecords(
+    config.soldListTable
   );
 
   const syncResult = await syncListingsToAirtable(normalizedRows, {
     dryRun,
     existingListings,
     existingMovedRecords,
+    existingPendingRecords,
+    existingSoldRecords,
   });
 
   const result = {
