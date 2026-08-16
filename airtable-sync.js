@@ -18,7 +18,12 @@ const THROTTLE_MAX_MS = 350;
 const CENSUS_THROTTLE_MS = 150;
 const DRY_RUN_SAMPLE_COUNT = 3;
 const MAX_CSV_ATTACHMENT_BYTES = 5 * 1024 * 1024;
-const SYNC_RUN_CSV_FIELD = "CSV";
+const SYNC_RUN_CSV_FIELD = "CSV File";
+const SYNC_RUN_CSV_FIELD_FALLBACKS = ["CSV File", "CSV"];
+const ATTACHMENT_UPLOAD_HOSTS = [
+  "https://content.airtable.com",
+  "https://api.airtable.com",
+];
 const DEFAULT_STATE = "VA";
 const CENSUS_GEOCODER_URL =
   "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress";
@@ -846,8 +851,8 @@ export async function writeSyncRunRecord(fields, options = {}) {
     let csvAttachError = null;
     if (recordId && csvPath) {
       const attachErrors = [];
-      // Live base: "CSV File" is attachments. Intended schema: "CSV" is.
-      for (const fieldName of ["CSV File", "CSV"]) {
+      // Live base has both "CSV File" and "CSV" as attachment columns.
+      for (const fieldName of SYNC_RUN_CSV_FIELD_FALLBACKS) {
         try {
           await uploadCsvAttachment(recordId, csvPath, fieldName);
           csvAttached = true;
@@ -878,8 +883,9 @@ export async function writeSyncRunRecord(fields, options = {}) {
 }
 
 /**
- * Upload a local CSV into Sync Runs attachment field `CSV`
- * via Airtable uploadAttachment (max 5 MB).
+ * Upload a local CSV into a Sync Runs attachment field.
+ * Must use content.airtable.com — api.airtable.com returns 404 NOT_FOUND
+ * for this endpoint even with a valid record and field.
  */
 export async function uploadCsvAttachment(
   recordId,
@@ -896,32 +902,42 @@ export async function uploadCsvAttachment(
     );
   }
 
-  await throttle();
-
-  const url = `https://api.airtable.com/v0/${config.baseId}/${encodeURIComponent(recordId)}/${encodeURIComponent(fieldName)}/uploadAttachment`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${config.pat}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      contentType: "text/csv",
-      filename: path.basename(absolutePath),
-      file: buffer.toString("base64"),
-    }),
+  const body = JSON.stringify({
+    contentType: "text/csv",
+    filename: path.basename(absolutePath),
+    file: buffer.toString("base64"),
   });
 
-  airtableApiRequestCount += 1;
+  let lastError = null;
+  for (const host of ATTACHMENT_UPLOAD_HOSTS) {
+    await throttle();
 
-  if (!response.ok) {
+    const url = `${host}/v0/${config.baseId}/${encodeURIComponent(recordId)}/${encodeURIComponent(fieldName)}/uploadAttachment`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.pat}`,
+        "Content-Type": "application/json",
+      },
+      body,
+    });
+
+    airtableApiRequestCount += 1;
+
+    if (response.ok) {
+      return response.json();
+    }
+
     const errorBody = await response.text();
-    throw new Error(
-      `Airtable uploadAttachment failed (${response.status}): ${errorBody}`
-    );
+    lastError = `${host} ${response.status}: ${errorBody}`;
+
+    // 404 on api.airtable.com is expected; try the next host.
+    if (response.status !== 404) {
+      break;
+    }
   }
 
-  return response.json();
+  throw new Error(`Airtable uploadAttachment failed (${lastError})`);
 }
 
 function buildSyncRunFieldsFromResult(result, source = "sync") {
@@ -1099,6 +1115,9 @@ export async function runAirtableSync(csvFilePath, options = {}) {
     );
   } else if (syncRun.csv_attach_error) {
     result.csv_attach_error = syncRun.csv_attach_error;
+    console.error(
+      `::error::Airtable CSV attach failed: ${syncRun.csv_attach_error}`
+    );
   }
 
   return result;

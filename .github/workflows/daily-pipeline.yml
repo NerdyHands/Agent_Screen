@@ -4,7 +4,6 @@
 #   BROWSERBASE_PROJECT_ID
 #   ONEHOME_URL
 #   AIRTABLE_PAT
-#   AIRTABLE_BASE_ID
 #
 # DRY_RUN is intentionally unset so production always writes.
 # Edit table names below if your Airtable names differ.
@@ -31,7 +30,8 @@ jobs:
       BROWSERBASE_PROJECT_ID: ${{ secrets.BROWSERBASE_PROJECT_ID }}
       ONEHOME_URL: ${{ secrets.ONEHOME_URL }}
       AIRTABLE_PAT: ${{ secrets.AIRTABLE_PAT }}
-      AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+      # Team workspace copy. Airtable base IDs are identifiers, not secrets.
+      AIRTABLE_BASE_ID: app0j55AyIphSWR1J
       AIRTABLE_LISTINGS_TABLE: Listings
       AIRTABLE_CHANGE_LOG_TABLE: Change Log
       AIRTABLE_MOVED_LIST_TABLE: Moved List
@@ -55,7 +55,7 @@ jobs:
       - name: Verify required secrets
         run: |
           missing=()
-          for key in BROWSERBASE_API_KEY BROWSERBASE_PROJECT_ID ONEHOME_URL AIRTABLE_PAT AIRTABLE_BASE_ID; do
+          for key in BROWSERBASE_API_KEY BROWSERBASE_PROJECT_ID ONEHOME_URL AIRTABLE_PAT; do
             if [ -z "${!key}" ]; then
               missing+=("$key")
             fi
@@ -68,3 +68,20 @@ jobs:
 
       - name: Run export + Airtable sync
         run: npm run pipeline
+
+      - name: List downloaded files
+        if: always()
+        run: |
+          mkdir -p downloads
+          ls -la downloads
+
+      - name: Upload CSV and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: onehome-export
+          path: |
+            downloads/*.csv
+            downloads/*.png
+          if-no-files-found: warn
+          retention-days: 14

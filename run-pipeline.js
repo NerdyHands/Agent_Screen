@@ -41,6 +41,11 @@ async function main() {
         `Sync succeeded but Airtable Sync Runs row was not written: ${syncResult.sync_run_error ?? "unknown error"}`
       );
       process.exitCode = 1;
+    } else if (exportResult.csv_file && !syncResult.csv_attached) {
+      console.error(
+        `CSV was downloaded (${exportResult.csv_file}) but not attached to Sync Runs: ${syncResult.csv_attach_error ?? "unknown error"}`
+      );
+      process.exitCode = 1;
     }
   } catch (error) {
     pipelineSummary.success = false;

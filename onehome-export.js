@@ -161,55 +161,71 @@ async function configureRemoteDownloads(context, page) {
 
 async function fetchSessionDownload(apiKey, sessionId) {
   const endTime = Date.now() + DOWNLOAD_RETRY_MS;
+  let lastError = null;
 
   while (Date.now() < endTime) {
-    const listResponse = await fetch(
-      `${BROWSERBASE_DOWNLOADS_URL}?sessionId=${encodeURIComponent(sessionId)}`,
-      {
-        headers: { "x-bb-api-key": apiKey },
-      }
-    );
-
-    if (!listResponse.ok) {
-      throw new Error(
-        `Browserbase downloads list failed (${listResponse.status} ${listResponse.statusText})`
-      );
-    }
-
-    const payload = await listResponse.json();
-    const downloads = payload.downloads ?? [];
-
-    if (downloads.length > 0) {
-      const csvDownload =
-        downloads.find((item) => /\.csv$/i.test(item.filename)) ?? downloads[0];
-
-      const fileResponse = await fetch(
-        `${BROWSERBASE_DOWNLOADS_URL}/${csvDownload.id}`,
+    try {
+      const listResponse = await fetch(
+        `${BROWSERBASE_DOWNLOADS_URL}?sessionId=${encodeURIComponent(sessionId)}`,
         {
-          headers: {
-            "x-bb-api-key": apiKey,
-            Accept: "application/octet-stream",
-          },
+          headers: { "x-bb-api-key": apiKey },
         }
       );
 
-      if (!fileResponse.ok) {
-        throw new Error(
-          `Browserbase download fetch failed (${fileResponse.status} ${fileResponse.statusText})`
-        );
+      if (!listResponse.ok) {
+        lastError = `Browserbase downloads list failed (${listResponse.status} ${listResponse.statusText})`;
+        await sleep(2_000);
+        continue;
       }
 
-      return {
-        filename: csvDownload.filename,
-        buffer: Buffer.from(await fileResponse.arrayBuffer()),
-      };
+      const payload = await listResponse.json();
+      const downloads = payload.downloads ?? [];
+      const total = payload.total ?? downloads.length;
+
+      if (total > 0 && downloads.length > 0) {
+        const csvDownload =
+          downloads.find((item) => /\.csv$/i.test(item.filename)) ??
+          downloads[0];
+
+        const fileResponse = await fetch(
+          `${BROWSERBASE_DOWNLOADS_URL}/${csvDownload.id}`,
+          {
+            headers: {
+              "x-bb-api-key": apiKey,
+              Accept: "application/octet-stream",
+            },
+          }
+        );
+
+        if (!fileResponse.ok) {
+          lastError = `Browserbase download fetch failed (${fileResponse.status} ${fileResponse.statusText})`;
+          await sleep(2_000);
+          continue;
+        }
+
+        const buffer = Buffer.from(await fileResponse.arrayBuffer());
+        if (buffer.length === 0) {
+          lastError = "Browserbase download was empty";
+          await sleep(2_000);
+          continue;
+        }
+
+        return {
+          filename: csvDownload.filename,
+          buffer,
+        };
+      }
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
     }
 
     await sleep(2_000);
   }
 
   throw new Error(
-    "CSV download did not appear in Browserbase session storage within the retry window."
+    lastError
+      ? `CSV download did not appear in Browserbase session storage within the retry window (${lastError})`
+      : "CSV download did not appear in Browserbase session storage within the retry window."
   );
 }
 
@@ -303,6 +319,7 @@ export async function runOneHomeExport() {
       success: true,
       browserbase_session_id: session.id,
       csv_file: csvPath,
+      csv_bytes: remoteFile.buffer.length,
     };
   } catch (error) {
     if (page) {
