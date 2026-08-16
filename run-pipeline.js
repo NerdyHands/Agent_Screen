@@ -35,6 +35,13 @@ async function main() {
         2
       )
     );
+
+    if (!syncResult.sync_run_written) {
+      console.error(
+        `Sync succeeded but Airtable Sync Runs row was not written: ${syncResult.sync_run_error ?? "unknown error"}`
+      );
+      process.exitCode = 1;
+    }
   } catch (error) {
     pipelineSummary.success = false;
     pipelineSummary.error =

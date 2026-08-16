@@ -781,10 +781,22 @@ export async function executeAirtableWrites(plan) {
   );
 }
 
+function omitEmptySyncRunFields(fields) {
+  const cleaned = {};
+  for (const [key, value] of Object.entries(fields)) {
+    if (value === null || value === undefined || value === "") {
+      continue;
+    }
+    cleaned[key] = value;
+  }
+  return cleaned;
+}
+
 /**
  * Write one Sync Runs health row. Best-effort: returns { ok, error? }.
  * Skipped entirely when DRY_RUN=true.
- * When csv_path is set, uploads the file into the CSV attachment field.
+ * CSV filename is uploaded as an attachment (not sent as a string) because
+ * the live "CSV File" column is multipleAttachments.
  */
 export async function writeSyncRunRecord(fields, options = {}) {
   const dryRun = options.dryRun ?? isDryRun();
@@ -797,16 +809,15 @@ export async function writeSyncRunRecord(fields, options = {}) {
     const config = getConfig();
     const csvPath =
       options.csvPath ?? fields.csv_path ?? fields["CSV Path"] ?? null;
-    const csvBasename =
-      fields["CSV File"] ??
-      (csvPath ? path.basename(String(csvPath)) : null);
 
+    // Never send a filename string to "CSV File". In this Airtable base that
+    // column is multipleAttachments, so a string 422s the whole create
+    // (INVALID_ATTACHMENT_OBJECT) and Sync Runs stays empty.
     const payload = {
-      fields: {
+      fields: omitEmptySyncRunFields({
         "Run At": fields["Run At"] ?? new Date().toISOString(),
         Success: Boolean(fields.Success),
         Source: fields.Source ?? "sync",
-        "CSV File": csvBasename,
         "CSV Rows": fields["CSV Rows"] ?? null,
         "Normalized Rows": fields["Normalized Rows"] ?? null,
         Created: fields.Created ?? null,
@@ -823,7 +834,7 @@ export async function writeSyncRunRecord(fields, options = {}) {
         "Zip Unresolved": fields["Zip Unresolved"] ?? null,
         "API Requests": fields["API Requests"] ?? null,
         Error: fields.Error ?? null,
-      },
+      }),
     };
 
     const created = await createAirtableRecords(config.syncRunsTable, [
@@ -834,12 +845,21 @@ export async function writeSyncRunRecord(fields, options = {}) {
     let csvAttached = false;
     let csvAttachError = null;
     if (recordId && csvPath) {
-      try {
-        await uploadCsvAttachment(recordId, csvPath);
-        csvAttached = true;
-      } catch (error) {
-        csvAttachError =
-          error instanceof Error ? error.message : String(error);
+      const attachErrors = [];
+      // Live base: "CSV File" is attachments. Intended schema: "CSV" is.
+      for (const fieldName of ["CSV File", "CSV"]) {
+        try {
+          await uploadCsvAttachment(recordId, csvPath, fieldName);
+          csvAttached = true;
+          break;
+        } catch (error) {
+          attachErrors.push(
+            `${fieldName}: ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+      }
+      if (!csvAttached) {
+        csvAttachError = attachErrors.join("; ");
       }
     }
 
@@ -1074,6 +1094,9 @@ export async function runAirtableSync(csvFilePath, options = {}) {
   result.csv_attached = Boolean(syncRun.csv_attached);
   if (!syncRun.ok) {
     result.sync_run_error = syncRun.error;
+    console.error(
+      `::error::Airtable Sync Runs write failed: ${syncRun.error}`
+    );
   } else if (syncRun.csv_attach_error) {
     result.csv_attach_error = syncRun.csv_attach_error;
   }

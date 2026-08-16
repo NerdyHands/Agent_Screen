@@ -148,7 +148,12 @@ const TABLE_DEFINITIONS = [
         options: { color: "greenBright", icon: "check" },
       },
       { name: "Source", type: "singleLineText" },
-      { name: "CSV File", type: "singleLineText" },
+      // Keep this as singleLineText. If CSV File is an attachment field,
+      // sending a filename string 422s the whole Sync Runs create.
+      {
+        name: "CSV File",
+        type: "singleLineText",
+      },
       {
         name: "CSV",
         type: "multipleAttachments",
