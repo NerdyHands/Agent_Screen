@@ -172,6 +172,7 @@ const TABLE_DEFINITIONS = [
       { name: "Zip Unresolved", type: "number", options: { precision: 0 } },
       { name: "API Requests", type: "number", options: { precision: 0 } },
       { name: "Error", type: "multilineText" },
+      { name: "Write Errors", type: "multilineText" },
     ],
   },
 ];

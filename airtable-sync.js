@@ -750,40 +750,82 @@ export async function updateAirtableRecords(tableName, records) {
   return updated;
 }
 
-// STEP 8: Airtable writes begin here
+// STEP 8: Airtable writes begin here.
+// Each write is fault-isolated so one broken table cannot skip the rest.
 export async function executeAirtableWrites(plan) {
   const config = getConfig();
+  const tableWriteResults = [];
 
-  await createAirtableRecords(config.listingsTable, plan.recordsToCreate);
-  await updateAirtableRecords(config.listingsTable, plan.recordsToUpdate);
-  await createAirtableRecords(
-    config.changeLogTable,
-    plan.changeLogRecordsToCreate
+  async function runIsolatedWrite(table, operation, writeFn) {
+    try {
+      await writeFn();
+      tableWriteResults.push({ table, operation, error: null });
+    } catch (error) {
+      tableWriteResults.push({
+        table,
+        operation,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  await runIsolatedWrite(config.listingsTable, "create", () =>
+    createAirtableRecords(config.listingsTable, plan.recordsToCreate)
   );
-  await createAirtableRecords(
-    config.movedListTable,
-    plan.movedListRecordsToCreate
+  await runIsolatedWrite(config.listingsTable, "update", () =>
+    updateAirtableRecords(config.listingsTable, plan.recordsToUpdate)
   );
-  await updateAirtableRecords(
-    config.movedListTable,
-    plan.movedListRecordsToUpdate
+  await runIsolatedWrite(config.changeLogTable, "create", () =>
+    createAirtableRecords(
+      config.changeLogTable,
+      plan.changeLogRecordsToCreate
+    )
   );
-  await createAirtableRecords(
-    config.pendingListTable,
-    plan.pendingListRecordsToCreate
+  await runIsolatedWrite(config.movedListTable, "create", () =>
+    createAirtableRecords(
+      config.movedListTable,
+      plan.movedListRecordsToCreate
+    )
   );
-  await updateAirtableRecords(
-    config.pendingListTable,
-    plan.pendingListRecordsToUpdate
+  await runIsolatedWrite(config.movedListTable, "update", () =>
+    updateAirtableRecords(
+      config.movedListTable,
+      plan.movedListRecordsToUpdate
+    )
   );
-  await createAirtableRecords(
-    config.soldListTable,
-    plan.soldListRecordsToCreate
+  await runIsolatedWrite(config.pendingListTable, "create", () =>
+    createAirtableRecords(
+      config.pendingListTable,
+      plan.pendingListRecordsToCreate
+    )
   );
-  await updateAirtableRecords(
-    config.soldListTable,
-    plan.soldListRecordsToUpdate
+  await runIsolatedWrite(config.pendingListTable, "update", () =>
+    updateAirtableRecords(
+      config.pendingListTable,
+      plan.pendingListRecordsToUpdate
+    )
   );
+  await runIsolatedWrite(config.soldListTable, "create", () =>
+    createAirtableRecords(config.soldListTable, plan.soldListRecordsToCreate)
+  );
+  await runIsolatedWrite(config.soldListTable, "update", () =>
+    updateAirtableRecords(config.soldListTable, plan.soldListRecordsToUpdate)
+  );
+
+  return { tableWriteResults };
+}
+
+export function formatTableWriteErrors(tableWriteResults) {
+  if (!Array.isArray(tableWriteResults) || tableWriteResults.length === 0) {
+    return null;
+  }
+  const failed = tableWriteResults.filter((entry) => entry.error);
+  if (failed.length === 0) {
+    return null;
+  }
+  return failed
+    .map((entry) => `${entry.table}: ${entry.error}`)
+    .join("\n");
 }
 
 function omitEmptySyncRunFields(fields) {
@@ -839,6 +881,7 @@ export async function writeSyncRunRecord(fields, options = {}) {
         "Zip Unresolved": fields["Zip Unresolved"] ?? null,
         "API Requests": fields["API Requests"] ?? null,
         Error: fields.Error ?? null,
+        "Write Errors": fields["Write Errors"] ?? null,
       }),
     };
 
@@ -964,6 +1007,7 @@ function buildSyncRunFieldsFromResult(result, source = "sync") {
     "Zip Unresolved": result.zip_unresolved ?? null,
     "API Requests": result.airtable_api_requests ?? null,
     Error: result.error ?? null,
+    "Write Errors": result.write_errors ?? null,
   };
 }
 
@@ -1045,13 +1089,16 @@ export async function syncListingsToAirtable(normalizedRows, options = {}) {
   }
 
   // STEP 8: Airtable writes begin here
-  await executeAirtableWrites(plan);
+  const { tableWriteResults } = await executeAirtableWrites(plan);
+  const writeErrors = formatTableWriteErrors(tableWriteResults);
 
   return {
     dry_run: false,
     ...summary,
     airtable_writes_started_after_comparison: true,
     airtable_api_requests: airtableApiRequestCount,
+    table_write_results: tableWriteResults,
+    write_errors: writeErrors,
   };
 }
 
